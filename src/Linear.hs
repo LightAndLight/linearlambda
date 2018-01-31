@@ -14,6 +14,7 @@ import Bound.Name
 import Control.Applicative
 import Control.Lens hiding (Context)
 import Control.Monad
+import Control.Monad.Unify
 import Data.Bifunctor
 import Data.Deriving
 import Data.Foldable
@@ -24,17 +25,40 @@ import Data.Monoid
 
 import qualified Data.Map as Map
 
-data Type
+data Type a
   = Con String
-  | Lolly Type Type
-  | Times Type Type
-  | Plus Type Type
-  | With Type Type
-  | Bang Type
+  | Lolly (Type a) (Type a)
+  | Times (Type a) (Type a)
+  | Plus (Type a) (Type a)
+  | With (Type a) (Type a)
+  | Bang (Type a)
   | Unit
   | Top
-  | TyVar String
+  | TyVar a
   deriving (Eq, Show, Ord)
+makeBound ''Type
+deriveShow1 ''Type
+deriveOrd1 ''Type
+deriveEq1 ''Type
+instance Show a => Show (Type a) where showsPrec = showsPrec1
+instance Ord a => Ord (Type a) where compare = compare1
+instance Eq a => Eq (Type a) where (==) = eq1
+
+instance Plated1 Type where
+  plate1 f (Lolly a b) = liftA2 Lolly (f a) (f b)
+  plate1 f (Times a b) = liftA2 Times (f a) (f b)
+  plate1 f (Plus a b) = liftA2 Plus (f a) (f b)
+  plate1 f (With a b) = liftA2 With (f a) (f b)
+  plate1 f (Bang a) = Bang <$> (f a)
+  plate1 f a = pure a
+
+instance Unifiable Type where
+  toplevelEqual Lolly{} Lolly{} = True
+  toplevelEqual Times{} Times{} = True
+  toplevelEqual Plus{} Plus{} = True
+  toplevelEqual With{} With{} = True
+  toplevelEqual Bang{} Bang{} = True
+  toplevelEqual _ _ = False
 
 renderType :: Type -> String
 renderType (Con a) = a
@@ -145,6 +169,7 @@ retrieve v (Context (e:es)) =
                   entryName <$>
                   filter (liftA2 (&&) isUnusedLinear ((/=v) . entryName)) (e:es)
 
+-- Equivalent to ExceptT (TypeError a) (State (Context a)) Type, but it's not a lot of code.
 infer :: Eq a => Expr a a -> Context a -> Either (TypeError a) (Type, Context a)
 infer (Var a) ctxt =
   retrieve a ctxt

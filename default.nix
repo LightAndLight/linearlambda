@@ -10,7 +10,10 @@ let
                        then pkgs.haskellPackages
                        else pkgs.haskell.packages.${compiler};
 
-  drv = haskellPackages.callPackage f {};
+  unification =
+    haskellPackages.callPackage (import ./nix/unification.nix) {};
+
+  drv = haskellPackages.callPackage f { inherit unification; };
 
 in
 
