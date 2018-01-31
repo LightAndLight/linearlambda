@@ -1,9 +1,14 @@
-{-# language DeriveFunctor, DeriveFoldable, DeriveTraversable, TemplateHaskell, FlexibleContexts, LambdaCase #-}
+{-# language DeriveFunctor #-}
+{-# language DeriveFoldable #-}
+{-# language DeriveTraversable #-}
+{-# language TemplateHaskell #-}
+{-# language FlexibleContexts #-}
+{-# language LambdaCase #-}
 module Linear where
 
 import Bound
 import Bound.Name
-import Control.Lens
+import Control.Lens hiding (Context)
 import Control.Monad
 import Data.Bifunctor
 import Data.Deriving
@@ -110,12 +115,13 @@ find v ctxt
   | otherwise = Left $ NotInScope v
 
 lookupDel :: Eq a => a -> [(a, b)] -> Maybe (b, [(a, b)])
-lookupDel a =
-  foldr
-    (\(x, y) b -> if a == x then Just (y, xs) else bimap id ((x, y) :) <$> b)
-    Nothing
+lookupDel _ [] = Nothing
+lookupDel a ((b, c):rest)
+  | a == b = Just (c, rest)
+  | otherwise = bimap id ((b, c) :) <$> lookupDel a rest
 
-partition :: Expr a a -> Expr a a -> Context a -> Either (TypeError a) (Context a, Context a)
+-- | Partition the
+partition :: Eq a => Expr a a -> Expr a a -> Context a -> Either (TypeError a) (Context a, Context a)
 partition a b ctxt =
   let
     afrees = toList a
@@ -125,24 +131,19 @@ partition a b ctxt =
     ls = ctxt'' ^. linears
   in
     if null ls
-    then Right (actxt, bctxt)
+    then Right (ctxt & linears .~ actxt, ctxt & linears .~ bctxt)
     else Left $ Unused (fst <$> ls)
   where
     partition' [] ctxt = ([], ctxt)
     partition' (x:xs) ctxt =
       case lookupDel x (ctxt ^. linears) of
-        Nothing -> partition' xs ctxt
-        Just (x', linears') -> bimap (x' :) id <$> partition' xs (ctxt & linears .~ linears')
+        Nothing
+          | -> partition' xs ctxt
+        Just (x', linears') ->
+          bimap ((x, x') :) id $
+          partition' xs (ctxt & linears .~ linears')
 
-distinct :: Eq a => Context a -> Context a -> Bool
-distinct [] _ = True
-distinct _ [] = True
-distinct as@((a, ty1):xs) bs@((b, ty2):ys) =
-  not (a == b && (case (ty1, ty2) of; (Bang{}, Bang{}) -> False; _ -> ty1 == ty2)) &&
-  distinct [(a, ty1)] ys &&
-  distinct [(b, ty2)] xs &&
-  distinct xs ys
-
+{-
 isBang :: Type -> Bool
 isBang Bang{} = True
 isBang _ = False
@@ -202,3 +203,4 @@ infer ctxt MkUnit =
   case filter (not . isBang . snd) ctxt of
     [] -> Right Unit
     _ -> Left . Unused $ fmap fst ctxt
+-}
