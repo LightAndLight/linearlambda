@@ -4,10 +4,14 @@
 {-# language TemplateHaskell #-}
 {-# language FlexibleContexts #-}
 {-# language LambdaCase #-}
+{-# language TypeFamilies #-}
+{-# language FlexibleInstances #-}
+{-# language MultiParamTypeClasses #-}
 module Linear where
 
 import Bound
 import Bound.Name
+import Control.Applicative
 import Control.Lens hiding (Context)
 import Control.Monad
 import Data.Bifunctor
@@ -15,7 +19,6 @@ import Data.Deriving
 import Data.Foldable
 import Data.Functor
 import Data.Functor.Classes
-import Data.List
 import Data.Map (Map)
 import Data.Monoid
 
@@ -84,123 +87,106 @@ data TypeError a
   | TypeMismatch Type Type
   deriving (Eq, Show)
 
-data Context a
-  = Context
-  { _linears :: [(a, Type)]
-  , _bangs :: Map a Type
-  }
+data Entry a
+  = LinearEntry a Type Bool
+  | BangEntry a Type
+  deriving (Eq, Show, Ord)
 
-makeLenses ''Context
+entryName :: Entry a -> a
+entryName (LinearEntry a _ _) = a
+entryName (BangEntry a _) = a
 
-insert :: Ord a => a -> Type -> Context a -> Context a
-insert v t ctxt =
-  case t of
-    Bang t' -> ctxt & bangs %~ Map.insert v t'
-    _ -> ctxt & linears %~ ((v, t) :)
-
-find :: Ord a => a -> Context a -> Either (TypeError a) Type
-find v ctxt
-  | ls <- ctxt ^. linears
-  , Just t <- lookup v ls =
-      case ls of
-        [_] -> Right t
-        _ -> Left $ Unused (fst <$> ls)
-  | Just t <- Map.lookup v (ctxt ^. bangs) =
-      let
-        ls = ctxt ^. linears
-      in
-        if null ls
-        then Right t
-        else Left $ Unused (fst <$> ls)
-  | otherwise = Left $ NotInScope v
-
-lookupDel :: Eq a => a -> [(a, b)] -> Maybe (b, [(a, b)])
-lookupDel _ [] = Nothing
-lookupDel a ((b, c):rest)
-  | a == b = Just (c, rest)
-  | otherwise = bimap id ((b, c) :) <$> lookupDel a rest
-
--- | Partition the
-partition :: Eq a => Expr a a -> Expr a a -> Context a -> Either (TypeError a) (Context a, Context a)
-partition a b ctxt =
-  let
-    afrees = toList a
-    (actxt, ctxt') = partition' afrees ctxt
-    bfrees = toList b
-    (bctxt, ctxt'') = partition' bfrees ctxt'
-    ls = ctxt'' ^. linears
-  in
-    if null ls
-    then Right (ctxt & linears .~ actxt, ctxt & linears .~ bctxt)
-    else Left $ Unused (fst <$> ls)
-  where
-    partition' [] ctxt = ([], ctxt)
-    partition' (x:xs) ctxt =
-      case lookupDel x (ctxt ^. linears) of
-        Nothing
-          | -> partition' xs ctxt
-        Just (x', linears') ->
-          bimap ((x, x') :) id $
-          partition' xs (ctxt & linears .~ linears')
-
-{-
-isBang :: Type -> Bool
-isBang Bang{} = True
+isBang :: Entry a -> Bool
+isBang BangEntry{} = True
 isBang _ = False
 
-infer :: (Eq a, Show a) => Context a -> Expr a a -> Either (TypeError a) Type
-infer ctxt (Var a) =
-  case lookup a ctxt of
-    Just t
-      | isBang t ->
-        if length (filter (not . isBang . snd) ctxt) == 0
-        then Right t
-        else
-          let
-            names = fmap fst ctxt
-          in
-            Left . Unused $ filter (/= a) names
-      | length (filter (not . isBang . snd) ctxt) == 1 -> Right t
-    _
-      | names <- fmap fst ctxt
-      , a `elem` names -> Left . Unused $ filter (/= a) names
-      | otherwise -> Left $ NotInScope a
-infer ctxt (Lam x t s) = Lolly t <$> infer ((x, t) : ctxt) (instantiate1 (Var x) s)
-infer ctxt (BangLam x t s) = Lolly (Bang t) <$> infer ((x, Bang t) : ctxt) (instantiate1 (Var x) s)
-infer ctxt (App a b) =
-  let
-    actxt = usedIn ctxt a
-    bctxt = usedIn ctxt b
-  in
-    if distinct actxt bctxt
-    then do
-      let unused = filter (`notElem` fmap fst (mappend actxt bctxt)) (fst <$> ctxt)
-      when (not $ null unused) . Left . Unused $ unused
-      aty <- infer actxt a
-      case aty of
-        Lolly from to -> do
-          ty' <- infer bctxt b
-          if from == ty' then Right from else Left $ TypeMismatch from ty'
-          pure to
-        _ -> Left $ TypeMismatch aty (Lolly (TyVar "a") (TyVar "b"))
-    else Left . MultipleUses . fmap fst $ filter ((`elem` bctxt)) actxt
-infer ctxt (MkL a) = Plus <$> infer ctxt a <*> pure (TyVar "a")
-infer ctxt (MkR a) = Plus (TyVar "a") <$> infer ctxt a
-infer ctxt (MkTimes a b) =
-  let
-    actxt = usedIn ctxt a
-    bctxt = usedIn ctxt b
-  in
-    if distinct actxt bctxt
-    then do
-      let unused = filter (`notElem` fmap fst (mappend actxt bctxt)) (fst <$> ctxt)
-      when (not $ null unused) . Left . Unused $ unused
-      Times <$> infer actxt a <*> infer bctxt b
-    else Left . MultipleUses . fmap fst $ filter ((`elem` bctxt)) actxt
-infer ctxt (MkWith a b) = With <$> infer ctxt a <*> infer ctxt b
-infer ctxt MkTop = Right Top
-infer ctxt MkUnit =
-  case filter (not . isBang . snd) ctxt of
-    [] -> Right Unit
-    _ -> Left . Unused $ fmap fst ctxt
--}
+isUnusedLinear :: Entry a -> Bool
+isUnusedLinear (LinearEntry _ _ b) = not b
+isUnusedLinear _ = False
+
+newtype Context a = Context [Entry a]
+  deriving (Eq, Show, Ord)
+
+makeWrapped ''Context
+
+insert :: a -> Type -> Context a -> Context a
+insert v t (Context ctxt) =
+  Context $
+  case t of
+    Bang t' -> BangEntry v t' : ctxt
+    _ -> LinearEntry v t False : ctxt
+
+retrieve :: Eq a => a -> Context a -> Either (TypeError a) (Type, Context a)
+retrieve v (Context []) = Left $ NotInScope v
+retrieve v (Context (e:es)) =
+  case e of
+    BangEntry v' t
+      | v == v' ->
+          case filter isUnusedLinear es of
+            [] -> Right (Bang t, Context $ e : es)
+            unused -> Left . Unused $ entryName <$> unused
+      | otherwise -> over (mapped._2._Wrapped) (e :) $ retrieve v (Context es)
+    LinearEntry v' t True
+      | v == v' -> Left (AlreadyUsed v)
+      | otherwise -> over (mapped._2._Wrapped) (e :) $ retrieve v (Context es)
+    LinearEntry v' t False
+      | v == v' ->
+          case filter isUnusedLinear es of
+            [] -> Right (t, Context $ LinearEntry v' t True : es)
+            unused -> Left . Unused $ entryName <$> unused
+      | otherwise ->
+          case find ((==v) . entryName) es of
+            Nothing -> Left $ NotInScope v
+            Just res ->
+              case res of
+                LinearEntry _ _ True -> Left $ AlreadyUsed v
+                _ ->
+                  Left . Unused $
+                  entryName <$>
+                  filter (liftA2 (&&) isUnusedLinear ((/=v) . entryName)) (e:es)
+
+infer :: Eq a => Expr a a -> Context a -> Either (TypeError a) (Type, Context a)
+infer (Var a) ctxt =
+  retrieve a ctxt
+
+infer (Lam x t s) ctxt = do
+  (ty, Context (_:ctxt)) <- over (mapped._1) (Lolly t) $ infer (instantiate1 (Var x) s) (insert x t ctxt)
+  pure (ty, Context ctxt)
+
+infer (BangLam x t s) ctxt = do
+  (ty, Context (_:ctxt)) <- over (mapped._1) (Lolly $ Bang t) $ infer (instantiate1 (Var x) s) (insert x (Bang t) ctxt)
+  pure (ty, Context ctxt)
+
+infer (App a b) ctxt = do
+  (aty, ctxt') <- infer a ctxt
+  case aty of
+    Lolly from to -> do
+      (bty, ctxt'') <- infer b ctxt'
+      if from == bty then Right from else Left $ TypeMismatch from bty
+      pure (to, ctxt'')
+    _ -> Left $ TypeMismatch aty (Lolly (TyVar "a") (TyVar "b"))
+
+infer (MkL a) ctxt = do
+  (aty, ctxt') <- infer a ctxt
+  pure (Plus aty $ TyVar "a", ctxt')
+
+infer (MkR a) ctxt = do
+  (aty, ctxt') <- infer a ctxt
+  pure (Plus (TyVar "a") aty, ctxt') 
+
+infer (MkTimes a b) ctxt = do
+  (aty, ctxt') <- infer a ctxt
+  (bty, ctxt'') <- infer b ctxt'
+  pure (Times aty bty, ctxt'')
+
+infer (MkWith a b) ctxt = do
+  (aty, _) <- infer a ctxt
+  (bty, _) <- infer b ctxt
+  pure (With aty bty, ctxt)
+
+infer MkTop ctxt = Right (Top, ctxt)
+
+infer MkUnit (Context ctxt) =
+  case filter isUnusedLinear ctxt of
+    [] -> Right (Unit, Context ctxt)
+    unused -> Left . Unused $ entryName <$> unused
